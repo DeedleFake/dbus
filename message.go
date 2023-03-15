@@ -7,6 +7,7 @@ import (
 	"io"
 	"reflect"
 	"strconv"
+	"sync"
 )
 
 const protoVersion byte = 1
@@ -158,9 +159,7 @@ func DecodeMessageWithFDs(rd io.Reader, fds []int) (msg *Message, err error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := binary.Read(bytes.NewBuffer(b), order, &hlength); err != nil {
-		return nil, err
-	}
+	binary.Read(bytes.NewBuffer(b), order, &hlength)
 	if hlength+length+16 > 1<<27 {
 		return nil, InvalidMessageError("message is too long")
 	}
@@ -213,69 +212,84 @@ func DecodeMessage(rd io.Reader) (msg *Message, err error) {
 	return DecodeMessageWithFDs(rd, make([]int, 0))
 }
 
-type nullwriter struct{}
-
-func (nullwriter) Write(p []byte) (cnt int, err error) {
-	return len(p), nil
-}
-
 func (msg *Message) CountFds() (int, error) {
 	if len(msg.Body) == 0 {
 		return 0, nil
 	}
-	enc := newEncoder(nullwriter{}, nativeEndian, make([]int, 0))
-	err := enc.Encode(msg.Body...)
-	return len(enc.fds), err
+	enc := newEncoder(io.Discard, nativeEndian, make([]int, 0))
+	for _, v := range msg.Body {
+		err := enc.Encode(v)
+		if err != nil {
+			return len(enc.fds), err
+		}
+	}
+	return len(enc.fds), nil
+}
+
+var bufPool sync.Pool
+
+func getBuffer() (*bytes.Buffer, func()) {
+	buf, _ := bufPool.Get().(*bytes.Buffer)
+	put := func() { bufPool.Put(buf) }
+	if buf == nil {
+		return new(bytes.Buffer), put
+	}
+	return buf, put
 }
 
 func (msg *Message) EncodeToWithFDs(out io.Writer, order binary.ByteOrder) (fds []int, err error) {
+	eb := endianByte(order)
+	if eb == 0 {
+		return nil, errors.New("dbus: invalid byte order")
+	}
+
 	if err := msg.validateHeader(); err != nil {
 		return nil, err
 	}
-	var vs [7]interface{}
-	switch order {
-	case binary.LittleEndian:
-		vs[0] = byte('l')
-	case binary.BigEndian:
-		vs[0] = byte('B')
-	default:
-		return nil, errors.New("dbus: invalid byte order")
-	}
-	body := new(bytes.Buffer)
-	fds = make([]int, 0)
-	enc := newEncoder(body, order, fds)
-	if len(msg.Body) != 0 {
-		err = enc.Encode(msg.Body...)
+
+	body, put := getBuffer()
+	defer put()
+	enc := newEncoderAtOffset(body, 12, order, nil)
+	encode := func(v interface{}) {
 		if err != nil {
 			return
 		}
+		err = enc.Encode(v)
 	}
-	vs[1] = msg.Type
-	vs[2] = msg.Flags
-	vs[3] = protoVersion
-	vs[4] = uint32(len(body.Bytes()))
-	vs[5] = msg.serial
+
 	headers := make([]header, 0, len(msg.Headers))
 	for k, v := range msg.Headers {
 		headers = append(headers, header{byte(k), v})
 	}
-	vs[6] = headers
-	var buf bytes.Buffer
-	enc = newEncoder(&buf, order, enc.fds)
-	err = enc.Encode(vs[:]...)
-	if err != nil {
-		return
-	}
+	encode(headers)
 	enc.align(8)
-	if _, err := body.WriteTo(&buf); err != nil {
+	blen := uint32(enc.pos)
+	for _, v := range msg.Body {
+		encode(v)
+	}
+	blen = uint32(enc.pos) - blen
+	if err != nil {
 		return nil, err
 	}
-	if buf.Len() > 1<<27 {
+
+	if enc.pos > 1<<27 {
 		return nil, InvalidMessageError("message is too long")
 	}
-	if _, err := buf.WriteTo(out); err != nil {
+
+	enc = newEncoder(out, order, enc.fds)
+	encode(eb)
+	encode(msg.Type)
+	encode(msg.Flags)
+	encode(protoVersion)
+	encode(blen)
+	encode(msg.serial)
+	if err != nil {
 		return nil, err
 	}
+	if _, err := io.Copy(out, body); err != nil {
+		return nil, err
+	}
+
 	return enc.fds, nil
 }
 
@@ -290,8 +304,7 @@ func (msg *Message) EncodeTo(out io.Writer, order binary.ByteOrder) (err error) 
 // IsValid checks whether msg is a valid message and returns an
 // InvalidMessageError or FormatError if it is not.
 func (msg *Message) IsValid() error {
-	var b bytes.Buffer
-	return msg.EncodeTo(&b, nativeEndian)
+	return msg.EncodeTo(io.Discard, nativeEndian)
 }
 
 func (msg *Message) validateHeader() error {

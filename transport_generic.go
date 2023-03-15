@@ -9,6 +9,17 @@ import (
 
 var nativeEndian binary.ByteOrder
 
+func endianByte(o binary.ByteOrder) byte {
+	switch o {
+	case binary.LittleEndian:
+		return 'l'
+	case binary.BigEndian:
+		return 'B'
+	default:
+		return 0
+	}
+}
+
 func detectEndianness() binary.ByteOrder {
 	var x uint32 = 0x01020304
 	if *(*byte)(unsafe.Pointer(&x)) == 0x01 {
